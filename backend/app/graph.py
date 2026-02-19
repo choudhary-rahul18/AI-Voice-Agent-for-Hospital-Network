@@ -1,85 +1,280 @@
-# backend/app/graph.py
+import sqlite3
+import logging
 from typing import Annotated
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import InMemorySaver
-from app.tools import loop_tools # Imported from the previous step
-import logging
 
-# Configure the logger to show timestamps and severity levels
-logging.basicConfig(
-    level=logging.INFO, # Change to DEBUG to see more detailed logs
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
 logger = logging.getLogger(__name__)
 
-# 1. Define the State (Tracks conversation history)
+# --- 1. UPDATED STATE (Added retry_count and intent tracking) ---
 class State(TypedDict):
     messages: Annotated[list, add_messages]
+    sql_query: str
+    db_result: str
+    error: str
+    retry_count: int
+    intent: str 
+    router_remarks: str
+    last_limit: int   
+    last_offset: int  
+    last_sql: str # Python tracks where we left off
 
 def build_graph():
-    # 2. Initialize Gemini (requires GEMINI_API_KEY in .env)
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
-    
-    # Bind our SQL search tool to the model
-    llm_with_tools = llm.bind_tools(loop_tools)
+    schema = """Table: hospitals. Columns: "HOSPITAL NAME" (TEXT), "Address" (TEXT), "CITY" (TEXT)."""
 
-    # 3. Define the Core Agent Node
-    def agent_node(state: State):
-        is_first_turn = len(state["messages"]) <= 1
+    # --- NODE 1: INTENT CLASSIFIER (Fix 1) ---
+    def classify_intent_node(state: State):
+        logger.info("\n[AGENT] 🧭 Classifying Intent...")
         
-        if is_first_turn:
-            greeting_rule = "Introduce yourself as 'Loop AI' since this is the beginning of the conversation."
+        prompt = """You are Loop AI's intent router. Analyze the user's request.
+        1. GREETING: Reply with 'GREETING: <response>'
+        2. HANDOFF: Reply with 'HANDOFF: Please hold while I transfer you.'
+        3. REJECT: Reply with 'REJECT: <response>'
+        4. PAGINATION: If the user asks for "more" or "next" hospitals from the PREVIOUS search, reply exactly with 'PAGINATION'
+        5. SEARCH: Reply with 'SEARCH | <instructions for the SQL agent>'
+        """
+        
+        messages = [SystemMessage(content=prompt)] + state["messages"]
+        response = llm.invoke(messages).content.strip()
+        response_upper = response.upper()
+
+        if response_upper.startswith("GREETING"):
+            clean_res = response.split(":", 1)[1].strip() if ":" in response else response
+            return {"intent": "direct", "db_result": clean_res}
+            
+        elif response_upper.startswith("HANDOFF"):
+            clean_res = response.split(":", 1)[1].strip() if ":" in response else response
+            return {"intent": "handoff", "db_result": clean_res}
+            
+        elif response_upper.startswith("REJECT"):
+            clean_res = response.split(":", 1)[1].strip() if ":" in response else response
+            return {"intent": "direct", "db_result": clean_res}
+            
+        elif response_upper.startswith("PAGINATION"):
+            return {"intent": "search", "router_remarks": "PAGINATION"}
+            
+        elif response_upper.startswith("SEARCH"):
+            remarks = response.split("|", 1)[1].strip() if "|" in response else "Limit to 5 results."
+            return {"intent": "search", "router_remarks": remarks}
+            
         else:
-            greeting_rule = "DO NOT introduce yourself. You are in the middle of a conversation. Speak naturally and directly answer the follow-up."
+            # THE SAFE FALLBACK: Do not assume search. Assume confusion.
+            logger.warning(f"\n[SYSTEM] ⚠️ Unexpected router output: {response}")
+            return {
+                "intent": "direct", 
+                "db_result": "I didn't quite catch that. Are you looking for hospital information?"
+            }
+        
 
-        # 3. THE UPGRADED SYSTEM PROMPT
-        system_message = SystemMessage(content=f"""
-        You are 'Loop AI', a helpful voice assistant for a hospital network.
-        
-        {greeting_rule}
+    # --- NODE 2: DIRECT RESPONSE (Handles Greeting/Rejection) ---
+    def direct_response_node(state: State):
+        logger.info("\n[AGENT] 🗣️ Replying directly (Greeting/Out of Scope)")
+        return {"messages": [AIMessage(content=state["db_result"])]}
 
-        SCOPE & INTENT RULES:
-        - You are fully authorized to provide hospital names, addresses, and confirm if they are in network.
-        - SPEECH TYPOS: If the user asks for something that sounds phonetically similar to hospital (like "hostel"), assume the microphone misheard them and answer regarding hospitals anyway, or ask a clarifying question. DO NOT reject them.
+    # --- NODE 3: SQL GENERATOR (Fix 5: Context retained) ---
+    def generate_sql_node(state: State):
+        remarks = state.get("router_remarks", "")
         
-        TOOL RULES:
-        - If the user asks "How many" hospitals there are, you MUST use the `count_hospitals` tool.
-        - If the user asks to "list" or "find" hospitals, use the `search_hospitals` tool. Use the 'offset' parameter if they ask for "more".
-        - Use your memory to answer follow-up questions about addresses if you already searched for them.
-
-        OUT OF SCOPE RULES:
-        - ONLY reject questions that are 100% unrelated to healthcare, hospitals, or addresses (e.g., coding, weather, recipes). 
-        - If truly out of scope, reply exactly with: "I'm sorry, I can't help with that. I am forwarding this to a human agent."
-        """)
+        # --- DETERMINISTIC STATE TRACKING ---
+        current_limit = state.get("last_limit", 5) 
+        last_sql = state.get("last_sql", "")
         
-        messages_to_send = [system_message] + state["messages"]
-        response = llm_with_tools.invoke(messages_to_send)
+        # Defensive string matching (Fix 3)
+        is_pagination = "PAGINATION" in remarks.strip().upper()
         
-        # 4. Update logging to use the logger you set up
-        if response.tool_calls:
-            logger.info(f"\n[SYSTEM LOG] 🧠 AGENT DECISION: Calling Tools: {[t['name'] for t in response.tool_calls]}")
+        if is_pagination and last_sql:
+            current_offset = state.get("last_offset", 0) + current_limit
+            # Fix 5: Inject exact previous query to prevent drift
+            injected_instruction = f"""
+            User wants the NEXT page of results. 
+            Modify this exact previous query:
+            {last_sql}
+            
+            STRICTLY apply LIMIT {current_limit} OFFSET {current_offset}.
+            Do NOT change the base WHERE clauses.
+            """
         else:
-            logger.info("\n[SYSTEM LOG] 🧠 AGENT DECISION: Answered from Memory/Context.")
+            current_offset = 0
+            injected_instruction = f"Manager Instructions: {remarks}. Apply LIMIT {current_limit}."
+            
+        logger.info(f"\n[AGENT] 🤖 SQL Generator thinking: {injected_instruction}")
+        
+        prompt = f"""You are a SQLite expert. Output ONLY a raw SQL SELECT query. Schema: {schema}
+        
+        >>> INSTRUCTIONS FOR THIS TURN: <<<
+        {injected_instruction}
+        
+        >>> STRICT LOGIC RULES: <<<
+        1. FUZZY MATCHING: Default to `LIKE '%keyword%'`. 
+        2. CITY ALIASES: For "Bangalore", check `(CITY LIKE '%Bangalore%' OR CITY LIKE '%Bengaluru%')`.
+        3. CLARIFY: If request is too vague, return 'CLARIFY'.
+        """
 
+        messages = [SystemMessage(content=prompt)] + state["messages"]
+        response = llm.invoke(messages)
+        sql = response.content.replace("```sql", "").replace("```", "").replace("ite", "").strip()
+        
+        if sql == "CLARIFY":
+            return {"sql_query": "CLARIFY", "error": None, "retry_count": 0}
+            
+        if "SELECT" in sql.upper():
+            sql = sql[sql.upper().find("SELECT"):]
+            
+        # --- FIX 2: PYTHON VERIFICATION (Trust, but Verify) ---
+        if "LIMIT" not in sql.upper():
+            logger.warning("\n[SYSTEM] ⚠️ LLM forgot LIMIT. Enforcing via Python.")
+            if is_pagination:
+                sql += f" LIMIT {current_limit} OFFSET {current_offset}"
+            else:
+                sql += f" LIMIT {current_limit}"
+                
+        # Save state for the next potential pagination turn
+        return {
+            "sql_query": sql, 
+            "error": None, 
+            "retry_count": 0,
+            "last_limit": current_limit,
+            "last_offset": current_offset,
+            "last_sql": sql
+        }
+
+
+    # --- NODE 4: SQL EXECUTOR (Fix 2, 6, 7: Security, Formatting, Timeouts) ---
+    def execute_sql_node(state: State):
+        query = state["sql_query"]
+        logger.info(f"\n[SYSTEM] ⚙️ Executing SQL: {query}")
+        
+        # Fix 2: SQL Injection / Mutation Prevention
+        if not query.upper().startswith("SELECT"):
+            logger.error("\n[SYSTEM] 🛑 SECURITY BLOCK: Non-SELECT query detected.")
+            return {"error": "Only SELECT queries are allowed.", "db_result": None}
+            
+        try:
+            # Fix 7: Timeouts
+            conn = sqlite3.connect('file:data/hospitals.db?mode=ro', uri=True, timeout=5.0)
+            cursor = conn.cursor()
+            
+            # Additional PRAGMA safeguard
+            conn.execute("PRAGMA busy_timeout = 3000")
+            
+            cursor.execute(query)
+            results = cursor.fetchall()
+            
+            # Fix 6: Dictionary formatting
+            if results:
+                columns = [desc[0] for desc in cursor.description]
+                formatted = [dict(zip(columns, row)) for row in results]
+                result_str = str(formatted)
+            else:
+                result_str = "No results found."
+                
+            conn.close()
+            return {"db_result": result_str, "error": None}
+            
+        except Exception as e:
+            return {"error": str(e), "db_result": None}
+
+    # --- NODE 5: ERROR REPAIR (Fix 3: Bounded Reflection) ---
+    def repair_sql_node(state: State):
+        logger.info(f"\n[AGENT] 🔧 Repair Agent fixing SQL (Attempt {state['retry_count'] + 1})...")
+        prompt = f"""You are a SQLite repair expert. Your previous query failed.
+        Schema: {schema}
+        Bad Query: {state['sql_query']}
+        Error Message: {state['error']}
+        
+        CRITICAL REPAIR RULES:
+        1. FUZZY MATCHING: If you are fixing a WHERE clause, ALWAYS use `LIKE '%keyword%'` instead of `=`. 
+           (Example: Change `CITY = 'Dwarka'` to `CITY LIKE '%Dwarka%'`).
+        2. Return ONLY the raw valid SQLite SELECT query. Do not write explanations.
+        """
+        
+        messages = [SystemMessage(content=prompt)] + state["messages"]
+        response = llm.invoke(messages)
+        sql = response.content.replace("```sql", "").replace("```", "").strip()
+        
+        return {"sql_query": sql, "error": None, "retry_count": state["retry_count"] + 1}
+
+    # --- NODE 6 & 7: SYNTHESIZERS ---
+    # --- NODE 6: SYNTHESIZER (The Human Voice) ---
+    def synthesize_node(state: State):
+        # 1. Handle Clarification with a conversational tone
+        if state.get("sql_query") == "CLARIFY":
+            prompt = """You are 'Loop AI', a warm and helpful voice assistant. 
+            The user's request was a bit too vague to search. 
+            Politely and naturally ask them to clarify which city or specific hospital name they are looking for."""
+        
+        # 2. Handle Database Results like a human
+        else:
+            db_data = state.get('db_result', 'No results found.')
+            prompt = f"""You are 'Loop AI', a highly intelligent, empathetic, and conversational voice assistant working for a hospital network.
+            Your job is to translate raw database results into a natural, friendly spoken response.
+            
+            >>> RAW DATABASE RESULT: {db_data} <<<
+            
+            CRITICAL VOICE RULES:
+            1. SOUND HUMAN: Speak naturally. Use conversational transitions (e.g., "I found a few options for you," or "Sure thing!").
+            2. NO JARGON: NEVER mention "SQL", "the database", "lists", or "tuples". 
+            3. HANDLING COUNTS: If the data is a single number like '[(124,)]', say it naturally: "We currently have 124 hospitals in that area."
+            4. HANDLING LISTS: If giving a list of addresses or names, read them clearly. 
+            5. EMPATHY ON EMPTY: If the data says 'No results found', be polite and helpful. Say something like: "I'm so sorry, but I couldn't find any hospitals matching that right now. Could we try a different location?"
+            """
+        
+        # State Isolation: Only send the prompt and the user's latest message to prevent confusion
+        messages = [SystemMessage(content=prompt), state["messages"][-1]]
+        response = llm.invoke(messages)
         return {"messages": [response]}
 
-    # 4. Construct the Graph
+    def synthesize_failure_node(state: State):
+        msg = "I'm having trouble accessing the database right now. Please try again."
+        return {"messages": [AIMessage(content=msg)]}
+
+    # --- ROUTING LOGIC ---
+    def route_intent(state: State):
+        if state["intent"] == "search":
+            return "generate_sql"
+        if state["intent"] in ["direct", "handoff"]:
+            return "direct_response"
+        return "direct_response" # Ultimate safety catch
+
+
+    def route_execution(state: State):
+        if state["sql_query"] == "CLARIFY":
+            return "synthesize" # Let the synthesizer ask the user for details
+        if state.get("error"):
+            if state.get("retry_count", 0) >= 2:
+                logger.error("\n[SYSTEM] 🛑 Max retries reached.")
+                return "synthesize_failure"
+            return "repair_sql"
+        return "synthesize"
+    
+    # --- BUILD THE GRAPH ---
     workflow = StateGraph(State)
-    workflow.add_node("agent", agent_node)
-    workflow.add_node("tools", ToolNode(loop_tools))
     
-    # 5. Define Routing Logic
-    workflow.add_edge(START, "agent")
-    # If Gemini decides to use a tool, go to tools. Otherwise, end.
-    workflow.add_conditional_edges("agent", tools_condition)
-    # After a tool finishes, send the data back to Gemini to speak
-    workflow.add_edge("tools", "agent")
+    workflow.add_node("classify_intent", classify_intent_node)
+    workflow.add_node("direct_response", direct_response_node)
+    workflow.add_node("generate_sql", generate_sql_node)
+    workflow.add_node("execute_sql", execute_sql_node)
+    workflow.add_node("repair_sql", repair_sql_node)
+    workflow.add_node("synthesize", synthesize_node)
+    workflow.add_node("synthesize_failure", synthesize_failure_node)
     
-    # Add memory so it can handle follow-up questions
+    workflow.add_edge(START, "classify_intent")
+    workflow.add_conditional_edges("classify_intent", route_intent)
+    
+    workflow.add_edge("direct_response", END)
+    
+    workflow.add_edge("generate_sql", "execute_sql")
+    workflow.add_conditional_edges("execute_sql", route_execution)
+    
+    workflow.add_edge("repair_sql", "execute_sql")
+    
+    workflow.add_edge("synthesize", END)
+    workflow.add_edge("synthesize_failure", END)
+    
     memory = InMemorySaver()
     return workflow.compile(checkpointer=memory)
