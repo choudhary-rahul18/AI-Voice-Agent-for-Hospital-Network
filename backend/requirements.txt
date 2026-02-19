@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+langgraph
+langchain-google-genai
+pandas
+SpeechRecognition
+gTTS
+python-dotenv
+pydub
