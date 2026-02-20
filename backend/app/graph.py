@@ -1,5 +1,5 @@
 import sqlite3
-import logging
+import logging, re
 from typing import Annotated
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
@@ -29,14 +29,17 @@ def build_graph():
 
     # --- NODE 1: INTENT CLASSIFIER (Fix 1) ---
     def classify_intent_node(state: State):
-        logger.info("\n[AGENT] 🧭 Classifying Intent...")
+        logger.info("\n\n\n[AGENT] 🧭 Classifying Intent...")
         
         prompt = """You are Loop AI's intent router. Analyze the user's request.
-        1. GREETING: Reply with 'GREETING: <response>'
+        1. GREETING: If the user says hello or asks who you are, reply EXACTLY with: 'GREETING: Hello! I am Loop AI, your hospital network voice assistant. How can I help you find a hospital today?'
         2. HANDOFF: Reply with 'HANDOFF: Please hold while I transfer you.'
-        3. REJECT: Reply with 'REJECT: <response>'
-        4. PAGINATION: If the user asks for "more" or "next" hospitals from the PREVIOUS search, reply exactly with 'PAGINATION'
-        5. SEARCH: Reply with 'SEARCH | <instructions for the SQL agent>'
+        3. REJECT: If completely out of scope, reply EXACTLY with: 'REJECT: I'm sorry, I can't help with that. I am forwarding this to a human agent.'
+        4. UNCLEAR: If the text is gibberish, reply with 'UNCLEAR: I didn't quite catch that. Could you repeat?'
+        5. PAGINATION: If the user asks for "more" or "next" hospitals, reply exactly with 'PAGINATION'
+        6. FOLLOW_UP: If the user asks for a detail about a specific item from the previous response... reply with 'SEARCH | Rerun the exact same hospital search...'
+        7. SEARCH: Reply with 'SEARCH | <semantic goal>'. 
+           CRITICAL: DO NOT write SQL syntax here. Do not use `=` or `WHERE`.
         """
         
         messages = [SystemMessage(content=prompt)] + state["messages"]
@@ -50,8 +53,14 @@ def build_graph():
         elif response_upper.startswith("HANDOFF"):
             clean_res = response.split(":", 1)[1].strip() if ":" in response else response
             return {"intent": "handoff", "db_result": clean_res}
+        
+        elif response_upper.startswith("UNCLEAR"):
+            clean_res = response.split(":", 1)[1].strip() if ":" in response else response
+            # This loops back to the user without hanging up
+            return {"intent": "direct", "db_result": clean_res}
             
         elif response_upper.startswith("REJECT"):
+            # This will now perfectly extract the exact assignment phrase
             clean_res = response.split(":", 1)[1].strip() if ":" in response else response
             return {"intent": "direct", "db_result": clean_res}
             
@@ -76,7 +85,7 @@ def build_graph():
         logger.info("\n[AGENT] 🗣️ Replying directly (Greeting/Out of Scope)")
         return {"messages": [AIMessage(content=state["db_result"])]}
 
-    # --- NODE 3: SQL GENERATOR (Fix 5: Context retained) ---
+    # --- NODE 3: SQL GENERATOR ---
     def generate_sql_node(state: State):
         remarks = state.get("router_remarks", "")
         
@@ -84,12 +93,11 @@ def build_graph():
         current_limit = state.get("last_limit", 5) 
         last_sql = state.get("last_sql", "")
         
-        # Defensive string matching (Fix 3)
+        # Defensive string matching
         is_pagination = "PAGINATION" in remarks.strip().upper()
         
         if is_pagination and last_sql:
             current_offset = state.get("last_offset", 0) + current_limit
-            # Fix 5: Inject exact previous query to prevent drift
             injected_instruction = f"""
             User wants the NEXT page of results. 
             Modify this exact previous query:
@@ -100,7 +108,8 @@ def build_graph():
             """
         else:
             current_offset = 0
-            injected_instruction = f"Manager Instructions: {remarks}. Apply LIMIT {current_limit}."
+            # FIX 1: Tell the LLM to use our default 5 ONLY IF the user didn't specify a number
+            injected_instruction = f"Manager Instructions: {remarks}. Apply LIMIT {current_limit} UNLESS the manager instructions specify a different limit."
             
         logger.info(f"\n[AGENT] 🤖 SQL Generator thinking: {injected_instruction}")
         
@@ -110,9 +119,11 @@ def build_graph():
         {injected_instruction}
         
         >>> STRICT LOGIC RULES: <<<
-        1. FUZZY MATCHING: Default to `LIKE '%keyword%'`. 
-        2. CITY ALIASES: For "Bangalore", check `(CITY LIKE '%Bangalore%' OR CITY LIKE '%Bengaluru%')`.
-        3. CLARIFY: If request is too vague, return 'CLARIFY'.
+        1. DATA PREFETCHING: ALWAYS use `SELECT *` instead of selecting specific columns, UNLESS the manager instructions specifically ask for a count or total number. If asking for a count, you MUST use `SELECT COUNT(*)`.
+        2. AVOID EXACT LONG STRINGS: NEVER filter `WHERE Address LIKE...` using a long, exact address string. It will cause the database to crash. Just filter by Hospital Name or City.
+        3. EXTREME FUZZY MATCHING: You MUST ALWAYS use `LIKE '%keyword%'`. NEVER use `=`. Replace spaces with `%` (e.g., `"HOSPITAL NAME" LIKE '%Abhay%Hospital%'`).
+        4. CITY ALIASES: For "Bangalore", check `(CITY LIKE '%Bangalore%' OR CITY LIKE '%Bengaluru%')`.
+        5. CLARIFY: If request is too vague, return 'CLARIFY'.
         """
 
         messages = [SystemMessage(content=prompt)] + state["messages"]
@@ -125,13 +136,20 @@ def build_graph():
         if "SELECT" in sql.upper():
             sql = sql[sql.upper().find("SELECT"):]
             
-        # --- FIX 2: PYTHON VERIFICATION (Trust, but Verify) ---
+        # --- PYTHON VERIFICATION (Trust, but Verify) ---
         if "LIMIT" not in sql.upper():
             logger.warning("\n[SYSTEM] ⚠️ LLM forgot LIMIT. Enforcing via Python.")
             if is_pagination:
                 sql += f" LIMIT {current_limit} OFFSET {current_offset}"
             else:
                 sql += f" LIMIT {current_limit}"
+                
+        # --- FIX 2: SYNCHRONIZE PYTHON STATE WITH LLM DECISION ---
+        # If the LLM successfully generated 'LIMIT 12', we must update our Python state
+        # so the next pagination jump is 12, not 5.
+        limit_match = re.search(r'LIMIT\s+(\d+)', sql.upper())
+        if limit_match:
+            current_limit = int(limit_match.group(1))
                 
         # Save state for the next potential pagination turn
         return {
@@ -142,7 +160,6 @@ def build_graph():
             "last_offset": current_offset,
             "last_sql": sql
         }
-
 
     # --- NODE 4: SQL EXECUTOR (Fix 2, 6, 7: Security, Formatting, Timeouts) ---
     def execute_sql_node(state: State):
@@ -201,30 +218,58 @@ def build_graph():
 
     # --- NODE 6 & 7: SYNTHESIZERS ---
     # --- NODE 6: SYNTHESIZER (The Human Voice) ---
+    # --- NODE 6: SYNTHESIZER (The Human Voice) ---
     def synthesize_node(state: State):
-        # 1. Handle Clarification with a conversational tone
-        if state.get("sql_query") == "CLARIFY":
-            prompt = """You are 'Loop AI', a warm and helpful voice assistant. 
-            The user's request was a bit too vague to search. 
-            Politely and naturally ask them to clarify which city or specific hospital name they are looking for."""
         
-        # 2. Handle Database Results like a human
+        # FIX 1: Check if this is the very first turn of the conversation
+        is_first_turn = len(state["messages"]) == 1
+        intro_rule = ""
+        if is_first_turn:
+            intro_rule = "CRITICAL: This is the first interaction. You MUST start your response by saying 'Hello, I am Loop AI...'"
+        
+        if state.get("sql_query") == "CLARIFY":
+            prompt = f"""You are 'Loop AI', a warm and helpful voice assistant. 
+            {intro_rule}
+            The user's request was a bit too vague to search. 
+            Politely ask them to clarify which city or specific hospital name they are looking for."""
+        
         else:
             db_data = state.get('db_result', 'No results found.')
-            prompt = f"""You are 'Loop AI', a highly intelligent, empathetic, and conversational voice assistant working for a hospital network.
+            # --- NODE 6: SYNTHESIZER (The Human Voice) ---
+    def synthesize_node(state: State):
+        
+        # FIX 1: Check if this is the very first turn of the conversation
+        is_first_turn = len(state["messages"]) == 1
+        intro_rule = ""
+        if is_first_turn:
+            intro_rule = "CRITICAL: This is the first interaction. You MUST start your response by saying 'Hello, I am Loop AI...'"
+        
+        if state.get("sql_query") == "CLARIFY":
+            prompt = f"""You are 'Loop AI', a warm and helpful voice assistant. 
+            {intro_rule}
+            The user's request was a bit too vague to search. 
+            Politely ask them to clarify which city or specific hospital name they are looking for."""
+        
+        else:
+            db_data = state.get('db_result', 'No results found.')
+            prompt = f"""You are 'Loop AI', a highly intelligent, empathetic voice assistant working for a hospital network.
             Your job is to translate raw database results into a natural, friendly spoken response.
             
             >>> RAW DATABASE RESULT: {db_data} <<<
             
             CRITICAL VOICE RULES:
-            1. SOUND HUMAN: Speak naturally. Use conversational transitions (e.g., "I found a few options for you," or "Sure thing!").
-            2. NO JARGON: NEVER mention "SQL", "the database", "lists", or "tuples". 
-            3. HANDLING COUNTS: If the data is a single number like '[(124,)]', say it naturally: "We currently have 124 hospitals in that area."
-            4. HANDLING LISTS: If giving a list of addresses or names, read them clearly. 
-            5. EMPATHY ON EMPTY: If the data says 'No results found', be polite and helpful. Say something like: "I'm so sorry, but I couldn't find any hospitals matching that right now. Could we try a different location?"
+            1. {intro_rule}
+            2. SOUND HUMAN: Speak naturally using conversational transitions.
+            3. NO JARGON: NEVER mention "SQL", "the database", or "tuples". 
+            4. TTS FORMATTING (IMPORTANT): NEVER use markdown bullet points or asterisks (*). If listing multiple hospitals, use spoken numbers (e.g., "Number one...", "Number two...") or natural transition words (e.g., "First...", "Next...", "Finally...").
+            5. EMPATHY ON EMPTY: If the data says 'No results found', say something like: "I'm so sorry, but I couldn't find any hospitals matching that right now."
+            6. CONCISENESS (CRITICAL): The database result contains extra pre-fetched data (like full addresses). ONLY read out the specific details the user explicitly asked for. If they only asked for names, DO NOT read the addresses.
             """
         
-        # State Isolation: Only send the prompt and the user's latest message to prevent confusion
+        messages = [SystemMessage(content=prompt), state["messages"][-1]]
+        response = llm.invoke(messages)
+        return {"messages": [response]}
+        
         messages = [SystemMessage(content=prompt), state["messages"][-1]]
         response = llm.invoke(messages)
         return {"messages": [response]}
