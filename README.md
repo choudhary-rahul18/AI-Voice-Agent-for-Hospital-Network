@@ -7,8 +7,6 @@
 
 An enterprise-grade AI voice agent built to navigate a massive hospital network database. This project was developed as a technical assignment to demonstrate advanced LLM orchestration, stateful conversational memory, and omnichannel API integration (Web UI + Telephony).
 
-🎥 **[Watch the 2-Minute Loom Demo Here](<INSERT_YOUR_LOOM_LINK_HERE>)**
-
 ---
 
 ## 🚀 Architectural Highlights
