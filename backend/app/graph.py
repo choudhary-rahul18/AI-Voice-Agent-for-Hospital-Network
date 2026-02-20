@@ -216,25 +216,6 @@ def build_graph():
         
         return {"sql_query": sql, "error": None, "retry_count": state["retry_count"] + 1}
 
-    # --- NODE 6 & 7: SYNTHESIZERS ---
-    # --- NODE 6: SYNTHESIZER (The Human Voice) ---
-    # --- NODE 6: SYNTHESIZER (The Human Voice) ---
-    def synthesize_node(state: State):
-        
-        # FIX 1: Check if this is the very first turn of the conversation
-        is_first_turn = len(state["messages"]) == 1
-        intro_rule = ""
-        if is_first_turn:
-            intro_rule = "CRITICAL: This is the first interaction. You MUST start your response by saying 'Hello, I am Loop AI...'"
-        
-        if state.get("sql_query") == "CLARIFY":
-            prompt = f"""You are 'Loop AI', a warm and helpful voice assistant. 
-            {intro_rule}
-            The user's request was a bit too vague to search. 
-            Politely ask them to clarify which city or specific hospital name they are looking for."""
-        
-        else:
-            db_data = state.get('db_result', 'No results found.')
             # --- NODE 6: SYNTHESIZER (The Human Voice) ---
     def synthesize_node(state: State):
         
@@ -270,9 +251,6 @@ def build_graph():
         response = llm.invoke(messages)
         return {"messages": [response]}
         
-        messages = [SystemMessage(content=prompt), state["messages"][-1]]
-        response = llm.invoke(messages)
-        return {"messages": [response]}
 
     def synthesize_failure_node(state: State):
         msg = "I'm having trouble accessing the database right now. Please try again."
